@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.7.0;
+
+import "hardhat/console.sol";
+
+contract Box {
+    uint256 private value;
+
+    // Emitted when the stored value changes
+    event ValueChanged(uint256 newValue);
+
+    // Stores a new value in the contract
+    function store(uint256 newValue) public {
+        console.log("Changing value from", value, "to", newValue);
+        value = newValue;
+        emit ValueChanged(newValue);
+    }
+
+    // Reads the last stored value
+    function retrieve() public view returns (uint256) {
+        return value;
+    }
+}
+
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.0;
+
+import "@chainlink/contracts/src/v0.6/ChainlinkClient.sol";
+import "@chainlink/contracts/src/v0.6/LinkTokenReceiver.sol";
+import "@chainlink/contracts/src/v0.6/interfaces/LinkTokenInterface.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+import "hardhat/console.sol";
+
+import "./Escrow.sol";
+import "./utils/WithStatus.sol";
+
+contract Comptroller is ChainlinkClient, WithStatus, LinkTokenReceiver {
+    bytes32 private jobId;
+    uint256 private fee;
+
+    /**
+     *
+     * @param _oracle The chainlink node oracle address to send requests
+     * @param _jobId The JobId for the Request
+     */
+    constructor(
+        address _link,
+        address _oracle,
+        bytes32 _jobId
+    ) public {
+        if (_link == address(0)) {
+            setPublicChainlinkToken();
+        } else {
+            setChainlinkToken(_link);
+        }
+        setChainlinkOracle(_oracle);
+        jobId = _jobId;
+        fee = 0.01 * 10**18; // 0.01 LINK
+    }
+
+    function withdrawFees(address payable _to, uint256 _amount)
+        public
+        onlyOwner()
+        statusAtLeast(Status.RETURN_ONLY)
+    {
+        Address.sendValue(_to, _amount);
+    }
+
+    /**
+     * @notice Returns the address of the LINK token
+     * @dev This is the public implementation for chainlinkTokenAddress, which is
+     * an internal method of the ChainlinkClient contract
+     */
+    function getChainlinkToken() public view override returns (address) {
+        return chainlinkTokenAddress();
+    }
+
+    function createFiatPaymentWithLinkRequest(
+        Escrow _seller,
+        address payable _buyer,
+        uint256 _amount,
+        string calldata _senderpaymentid
+    ) public statusAtLeast(Status.ACTIVE) {
+        bytes memory payload =
+            abi.encodeWithSignature(
+                "requestFiatPaymentWithLink(address,address,uint256,string)",
+                _seller,
+                _buyer,
+                _amount,
+                _senderpaymentid
+            );
+
+        require(
+            LinkTokenInterface(chainlinkTokenAddress()).transferAndCall(
+                address(this),
+                fee,
+                payload
+            ),
+            "comptroller: unable to transferAndCall"
+        );
+    }
+
+    function requestFiatPaymentWithLink(
+        Escrow _seller,
+        address payable _buyer,
+        uint256 _amount,
+        string calldata _senderpaymentid
+    ) public onlyLINK() {
+        _requestFiatPayment(_seller, _buyer, _amount, _senderpaymentid);
+    }
+
+    function requestFiatPayment(
+        Escrow _seller,
+        address payable _buyer,
+        uint256 _amount,
+        string calldata _senderpaymentid /* onlyOwner() */
+    ) public {
+        _requestFiatPayment(_seller, _buyer, _amount, _senderpaymentid);
+    }
+
+    function _requestFiatPayment(
+        Escrow _seller,
+        address payable _buyer,
+        uint256 _amount,
+        string calldata _senderpaymentid
+    ) internal statusAtLeast(Status.ACTIVE) {
+        require(
+            _seller.getUnlockedBalance() >= _amount,
+            "Comptroller: not enough funds in escrow"
+        );
+
+        Chainlink.Request memory req =
+            buildChainlinkRequest(
+                jobId, // Chainlink JobId
+                address(_seller), // contract address with the callback function
+                _seller.fulfillFiatPayment.selector // callback function selector
+            );
+        req.add("method", "collectrequest");
+        req.add("receiver", _seller.paymentid());
+        req.add("sender", _senderpaymentid);
+        req.addUint("amount", _seller.getAmountWithFee(_amount));
+
+        bytes32 reqId = sendChainlinkRequest(req, fee);
+        _seller.expectResponseFor(
+            chainlinkOracleAddress(),
+            reqId,
+            _buyer,
+            _amount
+        );
+    }
+
+    /**
+     * @dev We have the payable receive function to accept ether payment only
+     * and not the fallback function to avoid delegating calls further.
+     */
+    receive() external payable {} // solhint-disable-line no-empty-blocks
+}
+
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.0;
+pragma experimental ABIEncoderV2;
+
+import "@chainlink/contracts/src/v0.6/ChainlinkClient.sol";
+
+import "hardhat/console.sol";
+
+import "./adapters/EthAdapter.sol";
+import "./utils/WithStatus.sol";
+
+contract Escrow is ChainlinkClient, EthAdapter {
+    struct Job {
+        address payable buyer;
+        uint256 amount;
+    }
+    mapping(bytes32 => Job) private jobs;
+
+    address public owner;
+    address payable public comptroller;
+    string public paymentid;
+
+    constructor(
+        address _owner,
+        address payable _comptroller,
+        string memory _paymentid
+    ) public {
+        owner = _owner;
+        comptroller = _comptroller; // TODO: change this to be static with solpp?
+        paymentid = _paymentid;
+    }
+
+    modifier onlyOwner() {
+        require(owner == msg.sender, "Ownable: caller is not the owner");
+        _;
+    }
+
+    modifier onlyComptroller() {
+        require(
+            comptroller == msg.sender,
+            "Escrow: caller is not the comptroller"
+        );
+        _;
+    }
+
+    modifier statusAtLeast(Status _status) {
+        require(
+            WithStatus(comptroller).status() >= _status,
+            "invalid contract status"
+        );
+        _;
+    }
+
+    function withdraw(uint256 _amount, address payable _to)
+        public
+        onlyOwner()
+        statusAtLeast(Status.RETURN_ONLY)
+    {
+        require(
+            getUnlockedBalance() >= _amount,
+            "Escrow: insufficient unlocked funds to withdraw"
+        );
+        rawSendAsset(_amount, _to);
+    }
+
+    function expectResponseFor(
+        address _oracle,
+        bytes32 _requestId,
+        address payable _buyer,
+        uint256 _amount
+    ) public onlyComptroller statusAtLeast(Status.FINALIZE_ONLY) {
+        lockAssetWithFee(_amount); // check
+        jobs[_requestId] = Job({ buyer: _buyer, amount: _amount }); // effects
+        addChainlinkExternalRequest(_oracle, _requestId); // interaction
+    }
+
+    function fulfillFiatPayment(bytes32 _requestId, bool successful) public {
+        validateChainlinkCallback(_requestId);
+
+        Job memory job = jobs[_requestId];
+        delete jobs[_requestId]; // cleanup storage
+
+        if (successful) {
+            sendAssetWithFee(job.buyer, job.amount, comptroller);
+        } else {
+            unlockAssetWithFee(job.amount);
+        }
+    }
+}
+
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.0;
+pragma experimental ABIEncoderV2;
+
+import "@openzeppelin/contracts/utils/Address.sol";
+
+import "./Escrow.sol";
+
+contract EscrowFactory {
+    event Created(
+        address escrow,
+        address owner,
+        uint256 createdAt,
+        string paymentid,
+        uint256 amount
+    );
+
+    address payable comptroller;
+
+    mapping(address => address[]) private escrows;
+
+    constructor(address payable _comptroller) public {
+        comptroller = _comptroller;
+    }
+
+    function getEscrows(address _user) public view returns (address[] memory) {
+        return escrows[_user];
+    }
+
+    function newEscrow(string calldata paymentid)
+        public
+        payable
+        returns (address payable escrow)
+    {
+        Escrow instance = new Escrow(msg.sender, comptroller, paymentid);
+
+        escrow = address(instance);
+        escrows[msg.sender].push(escrow);
+        Address.sendValue(escrow, msg.value);
+
+        // solhint-disable-next-line not-rely-on-time
+        emit Created(escrow, msg.sender, block.timestamp, paymentid, msg.value);
+    }
+}
+
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.0;
+
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract SimpleEscrow is Ownable {
+    /* 0.49% or 100 gwei */
+    uint16 public constant feeThousandthsPercent = 490;
+    uint256 public constant minFeeAmount = 100 * 10**9;
+
+    address payable public comptroller;
+    address public node;
+
+    constructor(address payable _comptroller, address _node) public {
+        comptroller = _comptroller;
+        node = _node;
+    }
+
+    modifier onlyChainlinkNode() {
+        require(node == msg.sender, "SimpleEscrow: caller is not the node");
+        _;
+    }
+
+    function withdraw(uint256 _amount, address payable _to) public onlyOwner() {
+        require(
+            address(this).balance >= _amount,
+            "Escrow: insufficient funds to withdraw"
+        );
+        Address.sendValue(_to, _amount);
+    }
+
+    function getFee(uint256 _amount) internal pure returns (uint256) {
+        uint256 fee = (_amount * feeThousandthsPercent) / 100000;
+        return fee < minFeeAmount ? minFeeAmount : fee;
+    }
+
+    function getAmountWithFee(uint256 _amount) public pure returns (uint256) {
+        uint256 baseAmount = _amount;
+        return baseAmount + getFee(baseAmount);
+    }
+
+    function chainlinkTransfer(address payable _to, uint256 _amount)
+        public
+        onlyChainlinkNode
+    {
+        require(
+            address(this).balance >= _amount,
+            "Escrow: not enough funds to send"
+        );
+        Address.sendValue(_to, _amount);
+        Address.sendValue(comptroller, getFee(_amount));
+    }
+
+    /**
+     * @dev We have the payable receive function to accept ether payment only
+     * and not the fallback function to avoid delegating calls further.
+     */
+    receive() external payable {}
+}
