@@ -1,4 +1,4 @@
-# Antilop DAO
+# Antelope DAO
 
 ## Install
 
