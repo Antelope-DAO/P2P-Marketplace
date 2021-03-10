@@ -1,0 +1,115 @@
+import { run, ethers, upgrades } from "hardhat";
+
+async function main() {
+  // You can run Buidler tasks from a script.
+  // For example, we make sure everything is compiled by running "compile"
+  await run("compile");
+
+  const Box = await ethers.getContractFactory("Box");
+  console.log("Deploying Box...");
+
+  const box = await upgrades.deployProxy(Box, [42], { initializer: "store" });
+  console.log("Box deployed to:", box.address);
+}
+
+// We recommend this pattern to be able to use async/await everywhere
+// and properly handle errors.
+main()
+  .then(() => process.exit(0))
+  .catch(error => {
+    console.error(error);
+    process.exit(1);
+  });
+
+import { run, ethers } from "hardhat";
+import web3 from "web3";
+import { constants } from "ethers";
+
+import { Comptroller__factory, Escrow__factory } from "../types";
+
+const ORACLE_ADDRESS = "0x98cbfb4f664e6b35a32930c90e43f03b5eab50da";
+const JOBID = "3dd25a102fe74157b1eae12b430336f4";
+
+async function main() {
+  await run("typechain");
+
+  const accounts = await ethers.getSigners();
+  const account = accounts[0];
+
+  const Comptroller = new Comptroller__factory(account);
+  const Escrow = new Escrow__factory(account);
+
+  console.log("Deploying Comptroller...");
+  let comptroller = await Comptroller.deploy(
+    constants.AddressZero,
+    ORACLE_ADDRESS,
+    web3.utils.toHex(JOBID),
+  );
+  console.log("Comptroller deployed to:", comptroller.address);
+
+  console.log("Deploying Escrow...");
+  const escrow = await Escrow.deploy(
+    account.address,
+    comptroller.address,
+    "seller@upi",
+  );
+  console.log("Escrow deployed to:", escrow.address);
+
+  // Verify the contracts on etherscan
+  // The network will be the same as the one specified
+  // when running this deploy script.
+  // TODO: be DRY with arguments and addresses?
+  await run("verify", {
+    address: comptroller.address,
+    constructorArguments: [
+      constants.AddressZero,
+      ORACLE_ADDRESS,
+      web3.utils.toHex(JOBID),
+    ],
+  });
+
+  await run("verify", {
+    address: escrow.address,
+    constructorArguments: [account.address, comptroller.address, "seller@upi"],
+  });
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch(error => {
+    console.error(error);
+    process.exit(1);
+  });
+
+import { run, ethers } from "hardhat";
+
+import { SimpleEscrow__factory } from "../types";
+
+const COMP_ADDRESS = "0xcE589FC23EE7AB377e07c513e6b32e93ab57CF1B";
+const NODE_ADDRESS = "0xDb9D0B46628753523b6cc375Af63edaFb3Ac5668";
+
+async function main() {
+  await run("typechain");
+
+  const accounts = await ethers.getSigners();
+  const account = accounts[0];
+
+  const Escrow = new SimpleEscrow__factory(account);
+
+  console.log("Deploying Escrow...");
+  const escrow = await Escrow.deploy(COMP_ADDRESS, NODE_ADDRESS);
+  await escrow.deployTransaction.wait(2);
+  console.log("Escrow deployed to:", escrow.address);
+
+  await run("verify", {
+    address: escrow.address,
+    constructorArguments: [COMP_ADDRESS, NODE_ADDRESS],
+  });
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch(error => {
+    console.error(error);
+    process.exit(1);
+  });
